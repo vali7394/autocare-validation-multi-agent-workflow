@@ -194,106 +194,191 @@ CREATE TABLE IF NOT EXISTS ACES_VALIDATION.CATALOG.BRAND_SUB_BRAND (
     PRIMARY KEY (brand_id, sub_brand_id)
 );
 
--- Existing fitments (for comparison)
+-- Existing fitments (for comparison, with distinct_fitment_hash resolving collisions)
 CREATE TABLE IF NOT EXISTS ACES_VALIDATION.CATALOG.FITMENT (
-    fitment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fitment_id INTEGER AUTOINCREMENT,
     product_id INTEGER NOT NULL,
     base_vehicle_id INTEGER NOT NULL,
     part_type_id INTEGER NOT NULL,
     position_id INTEGER,
-    qualifiers VARIANT,           -- JSON array of qualifier IDs
-    notes VARIANT,                -- JSON array of note objects
-    vehicle_conditions VARIANT,   -- JSON object of attribute conditions
+    qualifiers VARIANT,                -- JSON array of qualifier IDs & parameters
+    notes VARIANT,                     -- JSON array of free-text notes
+    vehicle_conditions VARIANT,        -- JSON object of attribute conditions
+    distinct_fitment_hash VARCHAR PRIMARY KEY,  -- Extended Composite Key
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
-    UNIQUE (product_id, base_vehicle_id, part_type_id, position_id)
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
 );
 
 -- Index for efficient lookup by product
 CREATE INDEX IF NOT EXISTS idx_fitment_product ON ACES_VALIDATION.CATALOG.FITMENT(product_id);
 ```
 
+### 2.5 Staging Tables (Job-scoped)
+
+```sql
+-- Tracks individual validation job runs
+CREATE TABLE IF NOT EXISTS ACES_VALIDATION.STAGING.JOB_RUN (
+    job_id VARCHAR PRIMARY KEY,
+    status VARCHAR NOT NULL,            -- STAGED, VALIDATING, COMPARING, COMPLETED, FAILED
+    file_path VARCHAR NOT NULL,
+    line_code VARCHAR NOT NULL,
+    total_records INTEGER DEFAULT 0,
+    error_summary VARIANT,             -- Aggregated JSON metrics of failures
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Staging table for raw ACES XML parsed apps loaded via streaming COPY INTO
+CREATE TABLE IF NOT EXISTS ACES_VALIDATION.STAGING.FITMENT_STAGE (
+    job_id VARCHAR NOT NULL,
+    app_id VARCHAR,                    -- XML source element App ID
+    line_code VARCHAR NOT NULL,
+    supplier_part_number VARCHAR NOT NULL,
+    product_id INTEGER,                -- Resolved post-load
+    base_vehicle_id INTEGER NOT NULL,
+    part_type_id INTEGER NOT NULL,
+    position_id INTEGER,
+    qualifiers VARIANT,                -- JSON array of qualifier IDs & params
+    notes VARIANT,                     -- JSON array of text notes
+    vehicle_conditions VARIANT,        -- JSON object of attributes
+    distinct_fitment_hash VARCHAR,     -- Extended Composite Key
+    is_valid BOOLEAN DEFAULT TRUE,
+    error_type VARCHAR,                -- VCDB, QDB, PCDB, BRAND, PRODUCT, SYSTEM
+    error_message VARCHAR,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Clustered index on job_id and distinct_fitment_hash for set-based performance
+ALTER TABLE ACES_VALIDATION.STAGING.FITMENT_STAGE ADD PRIMARY KEY (job_id, distinct_fitment_hash);
+
+-- Holds results from change-detection comparison
+CREATE TABLE IF NOT EXISTS ACES_VALIDATION.STAGING.FITMENT_CLASSIFICATION (
+    job_id VARCHAR NOT NULL,
+    distinct_fitment_hash VARCHAR NOT NULL,
+    classification VARCHAR NOT NULL,   -- ADD, UPDATE, DELETE, UNCHANGED
+    change_details VARCHAR,            -- E.g. 'qualifiers_changed', 'notes_changed', etc.
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (job_id, distinct_fitment_hash)
+);
+```
+
 ---
 
 ## 3. Stored Procedures
 
+All validation and comparison stored procedures operate on the `STAGING` tables scoped by a `job_id`, performing bulk set-based operations.
+
 ### 3.1 VCDB Validation Procedures
 
 ```sql
--- Validate base vehicle IDs in batch
-CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_BASE_VEHICLE_IDS_BATCH(
-    base_vehicle_ids VARIANT  -- Array of integers
+-- Validate base vehicle IDs for a job (checks if they exist in VCDB)
+CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_BASE_VEHICLE_IDS_JOB(
+    job_id VARCHAR
 )
 RETURNS VARIANT
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    result VARIANT;
+    invalid_count INTEGER;
 BEGIN
-    SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
-        'base_vehicle_id', bv.id,
-        'is_valid', CASE WHEN v.base_vehicle_id IS NOT NULL THEN TRUE ELSE FALSE END
-    ))
-    INTO result
-    FROM TABLE(FLATTEN(INPUT => :base_vehicle_ids)) bv
-    LEFT JOIN ACES_VALIDATION.AUTOCARE.VCDB_BASE_VEHICLE v 
-        ON bv.value::INTEGER = v.base_vehicle_id AND v.is_active = TRUE;
-    
-    RETURN result;
+    UPDATE ACES_VALIDATION.STAGING.FITMENT_STAGE f
+    SET f.is_valid = FALSE,
+        f.error_type = 'VCDB',
+        f.error_message = CONCAT(COALESCE(f.error_message, ''), ' | Invalid Base Vehicle ID')
+    WHERE f.job_id = :job_id
+      AND f.is_valid = TRUE
+      AND f.base_vehicle_id NOT IN (
+          SELECT base_vehicle_id 
+          FROM ACES_VALIDATION.AUTOCARE.VCDB_BASE_VEHICLE 
+          WHERE is_active = TRUE
+      );
+
+    SELECT COUNT(*) INTO :invalid_count
+    FROM ACES_VALIDATION.STAGING.FITMENT_STAGE
+    WHERE job_id = :job_id AND is_valid = FALSE AND error_type = 'VCDB';
+
+    RETURN OBJECT_CONSTRUCT('job_id', :job_id, 'invalid_count', :invalid_count);
 END;
 $$;
 
--- Validate attribute values in batch
-CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_ATTRIBUTE_VALUES_BATCH(
-    attributes VARIANT  -- Array of {domain: string, value: integer}
+-- Validate attribute values (such as DriveType, FuelType, etc. contained in vehicle_conditions JSON)
+CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_ATTRIBUTE_VALUES_JOB(
+    job_id VARCHAR
 )
 RETURNS VARIANT
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    result VARIANT;
+    invalid_count INTEGER;
 BEGIN
-    -- This procedure validates attributes against their respective domain tables
-    -- Implementation depends on specific attribute domains
-    SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
-        'domain', attr.value:domain::STRING,
-        'value', attr.value:value::INTEGER,
-        'is_valid', TRUE  -- Simplified; actual impl queries domain tables
-    ))
-    INTO result
-    FROM TABLE(FLATTEN(INPUT => :attributes)) attr;
-    
-    RETURN result;
+    -- We parse the vehicle_conditions VARIANT to check that specific attribute IDs exist in VCDB domains.
+    -- Example for DriveType:
+    UPDATE ACES_VALIDATION.STAGING.FITMENT_STAGE f
+    SET f.is_valid = FALSE,
+        f.error_type = 'VCDB',
+        f.error_message = CONCAT(COALESCE(f.error_message, ''), ' | Invalid Drive Type ID')
+    WHERE f.job_id = :job_id
+      AND f.is_valid = TRUE
+      AND f.vehicle_conditions:DriveType IS NOT NULL
+      AND f.vehicle_conditions:DriveType::INTEGER NOT IN (
+          SELECT drive_type_id FROM ACES_VALIDATION.AUTOCARE.VCDB_DRIVE_TYPE WHERE is_active = TRUE
+      );
+
+    -- Example for FuelType:
+    UPDATE ACES_VALIDATION.STAGING.FITMENT_STAGE f
+    SET f.is_valid = FALSE,
+        f.error_type = 'VCDB',
+        f.error_message = CONCAT(COALESCE(f.error_message, ''), ' | Invalid Fuel Type ID')
+    WHERE f.job_id = :job_id
+      AND f.is_valid = TRUE
+      AND f.vehicle_conditions:FuelType IS NOT NULL
+      AND f.vehicle_conditions:FuelType::INTEGER NOT IN (
+          SELECT fuel_type_id FROM ACES_VALIDATION.AUTOCARE.VCDB_FUEL_TYPE WHERE is_active = TRUE
+      );
+
+    SELECT COUNT(*) INTO :invalid_count
+    FROM ACES_VALIDATION.STAGING.FITMENT_STAGE
+    WHERE job_id = :job_id AND is_valid = FALSE AND error_type = 'VCDB' AND error_message LIKE '%Type%';
+
+    RETURN OBJECT_CONSTRUCT('job_id', :job_id, 'invalid_count', :invalid_count);
 END;
 $$;
 
--- Resolve vehicle configuration (validates complete vehicle exists)
-CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.RESOLVE_VEHICLE_CONFIGURATION_BATCH(
-    configurations VARIANT  -- Array of {base_vehicle_id, attributes: {...}}
+-- Resolve vehicle configurations (checks if base vehicle + attributes resolve to a valid vehicle configuration)
+CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.RESOLVE_VEHICLE_CONFIGURATION_JOB(
+    job_id VARCHAR
 )
 RETURNS VARIANT
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    result VARIANT;
+    invalid_count INTEGER;
 BEGIN
-    -- For each configuration, check if a matching vehicle exists in VCDB_VEHICLE
-    -- This is a complex join that varies based on which attributes are provided
-    SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
-        'base_vehicle_id', cfg.value:base_vehicle_id::INTEGER,
-        'is_valid', CASE WHEN COUNT(v.vehicle_id) > 0 THEN TRUE ELSE FALSE END,
-        'matching_count', COUNT(v.vehicle_id)
-    ))
-    INTO result
-    FROM TABLE(FLATTEN(INPUT => :configurations)) cfg
-    LEFT JOIN ACES_VALIDATION.AUTOCARE.VCDB_VEHICLE v 
-        ON cfg.value:base_vehicle_id::INTEGER = v.base_vehicle_id
-    GROUP BY cfg.value:base_vehicle_id::INTEGER;
-    
-    RETURN result;
+    -- Marks fitments invalid if they have attributes that do not map to any active vehicle configuration
+    UPDATE ACES_VALIDATION.STAGING.FITMENT_STAGE f
+    SET f.is_valid = FALSE,
+        f.error_type = 'VCDB',
+        f.error_message = CONCAT(COALESCE(f.error_message, ''), ' | Vehicle configuration mismatch')
+    WHERE f.job_id = :job_id
+      AND f.is_valid = TRUE
+      -- Only evaluate records where specific attributes are specified
+      AND NOT EXISTS (
+          SELECT 1 
+          FROM ACES_VALIDATION.AUTOCARE.VCDB_VEHICLE v
+          WHERE v.base_vehicle_id = f.base_vehicle_id
+            AND v.is_active = TRUE
+            AND (f.vehicle_conditions:DriveType IS NULL OR v.drive_type_id = f.vehicle_conditions:DriveType::INTEGER)
+            AND (f.vehicle_conditions:FuelType IS NULL OR v.fuel_type_id = f.vehicle_conditions:FuelType::INTEGER)
+      );
+
+    SELECT COUNT(*) INTO :invalid_count
+    FROM ACES_VALIDATION.STAGING.FITMENT_STAGE
+    WHERE job_id = :job_id AND is_valid = FALSE AND error_message LIKE '%mismatch%';
+
+    RETURN OBJECT_CONSTRUCT('job_id', :job_id, 'invalid_count', :invalid_count);
 END;
 $$;
 ```
@@ -301,27 +386,37 @@ $$;
 ### 3.2 QDB Validation Procedures
 
 ```sql
--- Validate qualifier IDs in batch
-CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_QUALIFIER_IDS_BATCH(
-    qualifier_ids VARIANT  -- Array of integers
+-- Validate qualifier IDs (checks if all qualifier IDs specified in the qualifiers array exist in QDB)
+CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_QUALIFIER_IDS_JOB(
+    job_id VARCHAR
 )
 RETURNS VARIANT
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    result VARIANT;
+    invalid_count INTEGER;
 BEGIN
-    SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
-        'qualifier_id', q.id,
-        'is_valid', CASE WHEN qdb.qualifier_id IS NOT NULL THEN TRUE ELSE FALSE END
-    ))
-    INTO result
-    FROM TABLE(FLATTEN(INPUT => :qualifier_ids)) q
-    LEFT JOIN ACES_VALIDATION.AUTOCARE.QDB_QUALIFIER qdb 
-        ON q.value::INTEGER = qdb.qualifier_id AND qdb.is_active = TRUE;
-    
-    RETURN result;
+    -- Flattens the qualifiers array to identify invalid qualifiers and update staging
+    UPDATE ACES_VALIDATION.STAGING.FITMENT_STAGE f
+    SET f.is_valid = FALSE,
+        f.error_type = 'QDB',
+        f.error_message = CONCAT(COALESCE(f.error_message, ''), ' | Invalid Qualifier ID')
+    WHERE f.job_id = :job_id
+      AND f.is_valid = TRUE
+      AND EXISTS (
+          SELECT 1
+          FROM TABLE(FLATTEN(INPUT => f.qualifiers)) q
+          LEFT JOIN ACES_VALIDATION.AUTOCARE.QDB_QUALIFIER qdb
+              ON q.value:qualifier_id::INTEGER = qdb.qualifier_id AND qdb.is_active = TRUE
+          WHERE qdb.qualifier_id IS NULL
+      );
+
+    SELECT COUNT(*) INTO :invalid_count
+    FROM ACES_VALIDATION.STAGING.FITMENT_STAGE
+    WHERE job_id = :job_id AND is_valid = FALSE AND error_type = 'QDB';
+
+    RETURN OBJECT_CONSTRUCT('job_id', :job_id, 'invalid_count', :invalid_count);
 END;
 $$;
 ```
@@ -329,196 +424,239 @@ $$;
 ### 3.3 PCDB Validation Procedures
 
 ```sql
--- Validate part type IDs in batch
-CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_PART_TYPE_IDS_BATCH(
-    part_type_ids VARIANT  -- Array of integers
+-- Validate part type IDs (checks if they exist in PCDB)
+CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_PART_TYPE_IDS_JOB(
+    job_id VARCHAR
 )
 RETURNS VARIANT
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    result VARIANT;
+    invalid_count INTEGER;
 BEGIN
-    SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
-        'part_type_id', pt.id,
-        'is_valid', CASE WHEN pcdb.part_type_id IS NOT NULL THEN TRUE ELSE FALSE END
-    ))
-    INTO result
-    FROM TABLE(FLATTEN(INPUT => :part_type_ids)) pt
-    LEFT JOIN ACES_VALIDATION.AUTOCARE.PCDB_PART_TYPE pcdb 
-        ON pt.value::INTEGER = pcdb.part_type_id AND pcdb.is_active = TRUE;
-    
-    RETURN result;
+    UPDATE ACES_VALIDATION.STAGING.FITMENT_STAGE f
+    SET f.is_valid = FALSE,
+        f.error_type = 'PCDB',
+        f.error_message = CONCAT(COALESCE(f.error_message, ''), ' | Invalid Part Type ID')
+    WHERE f.job_id = :job_id
+      AND f.is_valid = TRUE
+      AND f.part_type_id NOT IN (
+          SELECT part_type_id 
+          FROM ACES_VALIDATION.AUTOCARE.PCDB_PART_TYPE 
+          WHERE is_active = TRUE
+      );
+
+    SELECT COUNT(*) INTO :invalid_count
+    FROM ACES_VALIDATION.STAGING.FITMENT_STAGE
+    WHERE job_id = :job_id AND is_valid = FALSE AND error_type = 'PCDB' AND error_message LIKE '%Part%';
+
+    RETURN OBJECT_CONSTRUCT('job_id', :job_id, 'invalid_count', :invalid_count);
 END;
 $$;
 
--- Validate position IDs in batch
-CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_POSITION_IDS_BATCH(
-    position_ids VARIANT  -- Array of integers
+-- Validate position IDs (checks if they exist in PCDB)
+CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_POSITION_IDS_JOB(
+    job_id VARCHAR
 )
 RETURNS VARIANT
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    result VARIANT;
+    invalid_count INTEGER;
 BEGIN
-    SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
-        'position_id', pos.id,
-        'is_valid', CASE WHEN pcdb.position_id IS NOT NULL THEN TRUE ELSE FALSE END
-    ))
-    INTO result
-    FROM TABLE(FLATTEN(INPUT => :position_ids)) pos
-    LEFT JOIN ACES_VALIDATION.AUTOCARE.PCDB_POSITION pcdb 
-        ON pos.value::INTEGER = pcdb.position_id AND pcdb.is_active = TRUE;
-    
-    RETURN result;
+    UPDATE ACES_VALIDATION.STAGING.FITMENT_STAGE f
+    SET f.is_valid = FALSE,
+        f.error_type = 'PCDB',
+        f.error_message = CONCAT(COALESCE(f.error_message, ''), ' | Invalid Position ID')
+    WHERE f.job_id = :job_id
+      AND f.is_valid = TRUE
+      AND f.position_id IS NOT NULL
+      AND f.position_id NOT IN (
+          SELECT position_id 
+          FROM ACES_VALIDATION.AUTOCARE.PCDB_POSITION 
+          WHERE is_active = TRUE
+      );
+
+    SELECT COUNT(*) INTO :invalid_count
+    FROM ACES_VALIDATION.STAGING.FITMENT_STAGE
+    WHERE job_id = :job_id AND is_valid = FALSE AND error_type = 'PCDB' AND error_message LIKE '%Position%';
+
+    RETURN OBJECT_CONSTRUCT('job_id', :job_id, 'invalid_count', :invalid_count);
 END;
 $$;
 
--- Validate part type to position mapping in batch
-CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_PART_TYPE_POSITION_BATCH(
-    mappings VARIANT  -- Array of {part_type_id, position_id}
+-- Validate part type to position mapping (checks if the position is valid for the given part type)
+CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.VALIDATE_PART_TYPE_POSITION_JOB(
+    job_id VARCHAR
 )
 RETURNS VARIANT
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    result VARIANT;
+    invalid_count INTEGER;
 BEGIN
-    SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
-        'part_type_id', m.value:part_type_id::INTEGER,
-        'position_id', m.value:position_id::INTEGER,
-        'is_valid', CASE WHEN ptp.part_type_id IS NOT NULL THEN TRUE ELSE FALSE END
-    ))
-    INTO result
-    FROM TABLE(FLATTEN(INPUT => :mappings)) m
-    LEFT JOIN ACES_VALIDATION.AUTOCARE.PCDB_PART_TYPE_POSITION ptp 
-        ON m.value:part_type_id::INTEGER = ptp.part_type_id 
-        AND m.value:position_id::INTEGER = ptp.position_id
-        AND ptp.is_active = TRUE;
-    
-    RETURN result;
+    UPDATE ACES_VALIDATION.STAGING.FITMENT_STAGE f
+    SET f.is_valid = FALSE,
+        f.error_type = 'PCDB',
+        f.error_message = CONCAT(COALESCE(f.error_message, ''), ' | Invalid Part-Type-Position Mapping')
+    WHERE f.job_id = :job_id
+      AND f.is_valid = TRUE
+      AND f.position_id IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 
+          FROM ACES_VALIDATION.AUTOCARE.PCDB_PART_TYPE_POSITION ptp
+          WHERE ptp.part_type_id = f.part_type_id 
+            AND ptp.position_id = f.position_id
+            AND ptp.is_active = TRUE
+      );
+
+    SELECT COUNT(*) INTO :invalid_count
+    FROM ACES_VALIDATION.STAGING.FITMENT_STAGE
+    WHERE job_id = :job_id AND is_valid = FALSE AND error_message LIKE '%Mapping%';
+
+    RETURN OBJECT_CONSTRUCT('job_id', :job_id, 'invalid_count', :invalid_count);
 END;
 $$;
 ```
 
-### 3.4 Comparison Procedures
+### 3.4 Product Resolution & Comparison Procedures
 
 ```sql
--- Fetch existing fitments by product IDs
-CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.FETCH_EXISTING_FITMENTS_BY_PRODUCTS(
-    product_ids VARIANT  -- Array of integers
+-- Resolve supplier part numbers to actual Product IDs
+CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.RESOLVE_PRODUCTS_JOB(
+    job_id VARCHAR,
+    line_code VARCHAR
 )
 RETURNS VARIANT
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    result VARIANT;
+    resolved_count INTEGER;
+    unresolved_count INTEGER;
 BEGIN
-    SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
-        'fitment_id', f.fitment_id,
-        'product_id', f.product_id,
-        'base_vehicle_id', f.base_vehicle_id,
-        'part_type_id', f.part_type_id,
-        'position_id', f.position_id,
-        'qualifiers', f.qualifiers,
-        'notes', f.notes,
-        'vehicle_conditions', f.vehicle_conditions,
-        'composite_key', CONCAT(f.product_id, '|', f.base_vehicle_id, '|', f.part_type_id, '|', COALESCE(f.position_id, 0))
-    ))
-    INTO result
-    FROM ACES_VALIDATION.CATALOG.FITMENT f
-    WHERE f.product_id IN (SELECT value::INTEGER FROM TABLE(FLATTEN(INPUT => :product_ids)));
-    
-    RETURN result;
+    -- Resolve part number using CATALOG.PRODUCT matching on line_code and part number
+    UPDATE ACES_VALIDATION.STAGING.FITMENT_STAGE f
+    SET f.product_id = p.product_id
+    FROM ACES_VALIDATION.CATALOG.PRODUCT p
+    WHERE f.job_id = :job_id
+      AND f.supplier_part_number = p.supplier_part_number
+      AND p.line_code = :line_code
+      AND p.is_active = TRUE;
+
+    -- Mark unresolved ones as product errors
+    UPDATE ACES_VALIDATION.STAGING.FITMENT_STAGE f
+    SET f.is_valid = FALSE,
+        f.error_type = 'PRODUCT',
+        f.error_message = CONCAT(COALESCE(f.error_message, ''), ' | Unresolved Supplier Part Number')
+    WHERE f.job_id = :job_id
+      AND f.product_id IS NULL;
+
+    SELECT COUNT(*) INTO :resolved_count
+    FROM ACES_VALIDATION.STAGING.FITMENT_STAGE
+    WHERE job_id = :job_id AND product_id IS NOT NULL;
+
+    SELECT COUNT(*) INTO :unresolved_count
+    FROM ACES_VALIDATION.STAGING.FITMENT_STAGE
+    WHERE job_id = :job_id AND product_id IS NULL;
+
+    RETURN OBJECT_CONSTRUCT('job_id', :job_id, 'resolved_count', :resolved_count, 'unresolved_count', :unresolved_count);
 END;
 $$;
 
--- Classify fitment changes (Add/Update/Delete)
-CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.CLASSIFY_FITMENT_CHANGES_BATCH(
-    incoming_fitments VARIANT,   -- Array of incoming fitment objects
-    existing_fitments VARIANT    -- Array of existing fitment objects (from fetch)
+-- Classify incoming fitments (ADD, UPDATE, UNCHANGED)
+CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.CLASSIFY_FITMENT_CHANGES_JOB(
+    job_id VARCHAR
 )
 RETURNS VARIANT
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    result VARIANT;
+    add_count INTEGER;
+    update_count INTEGER;
+    unchanged_count INTEGER;
 BEGIN
-    -- Build comparison and classify each incoming fitment
-    WITH incoming AS (
-        SELECT 
-            i.value:product_id::INTEGER AS product_id,
-            i.value:base_vehicle_id::INTEGER AS base_vehicle_id,
-            i.value:part_type_id::INTEGER AS part_type_id,
-            i.value:position_id::INTEGER AS position_id,
-            i.value:qualifiers AS qualifiers,
-            i.value:notes AS notes,
-            i.value:vehicle_conditions AS vehicle_conditions,
-            CONCAT(i.value:product_id, '|', i.value:base_vehicle_id, '|', i.value:part_type_id, '|', COALESCE(i.value:position_id, 0)) AS composite_key
-        FROM TABLE(FLATTEN(INPUT => :incoming_fitments)) i
-    ),
-    existing AS (
-        SELECT 
-            e.value:composite_key::STRING AS composite_key,
-            e.value:qualifiers AS qualifiers,
-            e.value:notes AS notes,
-            e.value:vehicle_conditions AS vehicle_conditions
-        FROM TABLE(FLATTEN(INPUT => :existing_fitments)) e
-    )
-    SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
-        'composite_key', inc.composite_key,
-        'classification', CASE 
-            WHEN ex.composite_key IS NULL THEN 'ADD'
-            WHEN inc.qualifiers = ex.qualifiers 
-                AND inc.notes = ex.notes 
-                AND inc.vehicle_conditions = ex.vehicle_conditions THEN 'UNCHANGED'
+    -- First clear any existing classifications for this job
+    DELETE FROM ACES_VALIDATION.STAGING.FITMENT_CLASSIFICATION WHERE job_id = :job_id;
+
+    -- Compare staging against CATALOG.FITMENT
+    INSERT INTO ACES_VALIDATION.STAGING.FITMENT_CLASSIFICATION (job_id, distinct_fitment_hash, classification, change_details)
+    SELECT 
+        f.job_id,
+        f.distinct_fitment_hash,
+        CASE 
+            WHEN cat.distinct_fitment_hash IS NULL THEN 'ADD'
+            WHEN f.qualifiers = cat.qualifiers 
+             AND f.notes = cat.notes 
+             AND f.vehicle_conditions = cat.vehicle_conditions THEN 'UNCHANGED'
             ELSE 'UPDATE'
         END,
-        'details', CASE 
-            WHEN ex.composite_key IS NULL THEN NULL
-            WHEN inc.qualifiers != ex.qualifiers THEN 'qualifiers_changed'
-            WHEN inc.notes != ex.notes THEN 'notes_changed'
-            WHEN inc.vehicle_conditions != ex.vehicle_conditions THEN 'conditions_changed'
+        CASE 
+            WHEN cat.distinct_fitment_hash IS NULL THEN NULL
+            WHEN f.qualifiers != cat.qualifiers THEN 'qualifiers_changed'
+            WHEN f.notes != cat.notes THEN 'notes_changed'
+            WHEN f.vehicle_conditions != cat.vehicle_conditions THEN 'conditions_changed'
             ELSE NULL
         END
-    ))
-    INTO result
-    FROM incoming inc
-    LEFT JOIN existing ex ON inc.composite_key = ex.composite_key;
-    
-    RETURN result;
+    FROM ACES_VALIDATION.STAGING.FITMENT_STAGE f
+    LEFT JOIN ACES_VALIDATION.CATALOG.FITMENT cat 
+        ON f.distinct_fitment_hash = cat.distinct_fitment_hash
+    WHERE f.job_id = :job_id 
+      AND f.is_valid = TRUE;
+
+    SELECT COUNT(*) INTO :add_count FROM ACES_VALIDATION.STAGING.FITMENT_CLASSIFICATION WHERE job_id = :job_id AND classification = 'ADD';
+    SELECT COUNT(*) INTO :update_count FROM ACES_VALIDATION.STAGING.FITMENT_CLASSIFICATION WHERE job_id = :job_id AND classification = 'UPDATE';
+    SELECT COUNT(*) INTO :unchanged_count FROM ACES_VALIDATION.STAGING.FITMENT_CLASSIFICATION WHERE job_id = :job_id AND classification = 'UNCHANGED';
+
+    RETURN OBJECT_CONSTRUCT(
+        'job_id', :job_id, 
+        'add_count', :add_count, 
+        'update_count', :update_count, 
+        'unchanged_count', :unchanged_count
+    );
 END;
 $$;
 
--- Identify deleted fitments (in existing but not in incoming)
-CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.IDENTIFY_DELETED_FITMENTS(
-    incoming_keys VARIANT,   -- Array of composite key strings
-    existing_keys VARIANT    -- Array of composite key strings
+-- Identify deleted fitments (existing fitments for these products that are not in incoming staging)
+CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.IDENTIFY_DELETED_FITMENTS_JOB(
+    job_id VARCHAR
 )
 RETURNS VARIANT
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    result VARIANT;
+    delete_count INTEGER;
 BEGIN
-    SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
-        'composite_key', ex.value::STRING,
-        'classification', 'DELETE'
-    ))
-    INTO result
-    FROM TABLE(FLATTEN(INPUT => :existing_keys)) ex
-    WHERE ex.value::STRING NOT IN (
-        SELECT inc.value::STRING FROM TABLE(FLATTEN(INPUT => :incoming_keys)) inc
+    -- Existing fitments that belong to the products processed in this job, 
+    -- but do not exist in STAGING.FITMENT_STAGE (where the distinct_fitment_hash is missing)
+    INSERT INTO ACES_VALIDATION.STAGING.FITMENT_CLASSIFICATION (job_id, distinct_fitment_hash, classification, change_details)
+    SELECT 
+        :job_id,
+        cat.distinct_fitment_hash,
+        'DELETE',
+        'fitment_removed_by_supplier'
+    FROM ACES_VALIDATION.CATALOG.FITMENT cat
+    WHERE cat.product_id IN (
+        SELECT DISTINCT product_id 
+        FROM ACES_VALIDATION.STAGING.FITMENT_STAGE 
+        WHERE job_id = :job_id AND product_id IS NOT NULL
+    )
+    AND cat.distinct_fitment_hash NOT IN (
+        SELECT distinct_fitment_hash 
+        FROM ACES_VALIDATION.STAGING.FITMENT_STAGE 
+        WHERE job_id = :job_id AND distinct_fitment_hash IS NOT NULL
     );
-    
-    RETURN result;
+
+    SELECT COUNT(*) INTO :delete_count 
+    FROM ACES_VALIDATION.STAGING.FITMENT_CLASSIFICATION 
+    WHERE job_id = :job_id AND classification = 'DELETE';
+
+    RETURN OBJECT_CONSTRUCT('job_id', :job_id, 'delete_count', :delete_count);
 END;
 $$;
 ```
@@ -526,7 +664,7 @@ $$;
 ### 3.5 Aggregation Procedures
 
 ```sql
--- Compute validation summary
+-- Compute validation summary statistics for a job
 CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.COMPUTE_VALIDATION_SUMMARY(
     job_id VARCHAR
 )
@@ -537,7 +675,6 @@ $$
 DECLARE
     result VARIANT;
 BEGIN
-    -- Aggregate validation results from staging table
     SELECT OBJECT_CONSTRUCT(
         'job_id', :job_id,
         'total_fitments', COUNT(*),
@@ -545,17 +682,18 @@ BEGIN
         'error_count', SUM(CASE WHEN NOT is_valid THEN 1 ELSE 0 END),
         'vcdb_errors', SUM(CASE WHEN error_type = 'VCDB' THEN 1 ELSE 0 END),
         'qdb_errors', SUM(CASE WHEN error_type = 'QDB' THEN 1 ELSE 0 END),
-        'pcdb_errors', SUM(CASE WHEN error_type = 'PCDB' THEN 1 ELSE 0 END)
+        'pcdb_errors', SUM(CASE WHEN error_type = 'PCDB' THEN 1 ELSE 0 END),
+        'product_errors', SUM(CASE WHEN error_type = 'PRODUCT' THEN 1 ELSE 0 END)
     )
     INTO result
-    FROM ACES_VALIDATION.STAGING.FITMENT_VALIDATION
+    FROM ACES_VALIDATION.STAGING.FITMENT_STAGE
     WHERE job_id = :job_id;
     
     RETURN result;
 END;
 $$;
 
--- Compute uplift summary
+-- Compute uplift classification summary statistics for a job
 CREATE OR REPLACE PROCEDURE ACES_VALIDATION.MCP.COMPUTE_UPLIFT_SUMMARY(
     job_id VARCHAR
 )
@@ -566,7 +704,6 @@ $$
 DECLARE
     result VARIANT;
 BEGIN
-    -- Aggregate classification results
     SELECT OBJECT_CONSTRUCT(
         'job_id', :job_id,
         'add_count', SUM(CASE WHEN classification = 'ADD' THEN 1 ELSE 0 END),
@@ -594,177 +731,174 @@ Create the Snowflake managed MCP server with all validation tools.
 CREATE OR REPLACE MCP SERVER ACES_VALIDATION.MCP.ACES_FITMENT_SERVER
 FROM SPECIFICATION $$
 tools:
-  # VCDB Validation Tools
-  - name: "validate_base_vehicle_ids_batch"
-    title: "Validate Base Vehicle IDs"
+  -- VCDB Validation Tools
+  - name: "validate_base_vehicle_ids_job"
+    title: "Validate Base Vehicle IDs for Job"
     type: "GENERIC"
-    identifier: "ACES_VALIDATION.MCP.VALIDATE_BASE_VEHICLE_IDS_BATCH"
-    description: "Validates an array of base vehicle IDs against VCDB. Returns validity status for each ID."
+    identifier: "ACES_VALIDATION.MCP.VALIDATE_BASE_VEHICLE_IDS_JOB"
+    description: "Validates base vehicle IDs inside FITMENT_STAGE for a specific job against VCDB."
     config:
       type: "procedure"
       warehouse: "ACES_VALIDATION_WH"
       input_schema:
         type: "object"
         properties:
-          base_vehicle_ids:
-            description: "Array of base vehicle IDs to validate"
-            type: "array"
-            items:
-              type: "integer"
+          job_id:
+            description: "Unique validation job identifier"
+            type: "string"
+        required: ["job_id"]
 
-  - name: "validate_attribute_values_batch"
-    title: "Validate Attribute Values"
+  - name: "validate_attribute_values_job"
+    title: "Validate Attribute Values for Job"
     type: "GENERIC"
-    identifier: "ACES_VALIDATION.MCP.VALIDATE_ATTRIBUTE_VALUES_BATCH"
-    description: "Validates attribute values against their VCDB domain tables."
+    identifier: "ACES_VALIDATION.MCP.VALIDATE_ATTRIBUTE_VALUES_JOB"
+    description: "Validates attribute values (DriveType, FuelType) in vehicle_conditions JSON for a specific job."
     config:
       type: "procedure"
       warehouse: "ACES_VALIDATION_WH"
       input_schema:
         type: "object"
         properties:
-          attributes:
-            description: "Array of {domain, value} objects"
-            type: "array"
+          job_id:
+            description: "Unique validation job identifier"
+            type: "string"
+        required: ["job_id"]
 
-  - name: "resolve_vehicle_configuration_batch"
-    title: "Resolve Vehicle Configuration"
+  - name: "resolve_vehicle_configuration_job"
+    title: "Resolve Vehicle Configuration for Job"
     type: "GENERIC"
-    identifier: "ACES_VALIDATION.MCP.RESOLVE_VEHICLE_CONFIGURATION_BATCH"
-    description: "Validates that base vehicle + attributes resolves to actual vehicle in VCDB."
+    identifier: "ACES_VALIDATION.MCP.RESOLVE_VEHICLE_CONFIGURATION_JOB"
+    description: "Validates that base vehicle + attributes resolve to a valid vehicle in VCDB for a specific job."
     config:
       type: "procedure"
       warehouse: "ACES_VALIDATION_WH"
       input_schema:
         type: "object"
         properties:
-          configurations:
-            description: "Array of {base_vehicle_id, attributes} objects"
-            type: "array"
+          job_id:
+            description: "Unique validation job identifier"
+            type: "string"
+        required: ["job_id"]
 
-  # QDB Validation Tools
-  - name: "validate_qualifier_ids_batch"
-    title: "Validate Qualifier IDs"
+  -- QDB Validation Tools
+  - name: "validate_qualifier_ids_job"
+    title: "Validate Qualifier IDs for Job"
     type: "GENERIC"
-    identifier: "ACES_VALIDATION.MCP.VALIDATE_QUALIFIER_IDS_BATCH"
-    description: "Validates an array of qualifier IDs against QDB."
+    identifier: "ACES_VALIDATION.MCP.VALIDATE_QUALIFIER_IDS_JOB"
+    description: "Validates qualifier IDs inside the qualifiers array for a specific job against QDB."
     config:
       type: "procedure"
       warehouse: "ACES_VALIDATION_WH"
       input_schema:
         type: "object"
         properties:
-          qualifier_ids:
-            description: "Array of qualifier IDs to validate"
-            type: "array"
-            items:
-              type: "integer"
+          job_id:
+            description: "Unique validation job identifier"
+            type: "string"
+        required: ["job_id"]
 
-  # PCDB Validation Tools
-  - name: "validate_part_type_ids_batch"
-    title: "Validate Part Type IDs"
+  -- PCDB Validation Tools
+  - name: "validate_part_type_ids_job"
+    title: "Validate Part Type IDs for Job"
     type: "GENERIC"
-    identifier: "ACES_VALIDATION.MCP.VALIDATE_PART_TYPE_IDS_BATCH"
-    description: "Validates an array of part type IDs against PCDB."
+    identifier: "ACES_VALIDATION.MCP.VALIDATE_PART_TYPE_IDS_JOB"
+    description: "Validates part type IDs for a specific job against PCDB."
     config:
       type: "procedure"
       warehouse: "ACES_VALIDATION_WH"
       input_schema:
         type: "object"
         properties:
-          part_type_ids:
-            description: "Array of part type IDs to validate"
-            type: "array"
-            items:
-              type: "integer"
+          job_id:
+            description: "Unique validation job identifier"
+            type: "string"
+        required: ["job_id"]
 
-  - name: "validate_position_ids_batch"
-    title: "Validate Position IDs"
+  - name: "validate_position_ids_job"
+    title: "Validate Position IDs for Job"
     type: "GENERIC"
-    identifier: "ACES_VALIDATION.MCP.VALIDATE_POSITION_IDS_BATCH"
-    description: "Validates an array of position IDs against PCDB."
+    identifier: "ACES_VALIDATION.MCP.VALIDATE_POSITION_IDS_JOB"
+    description: "Validates position IDs for a specific job against PCDB."
     config:
       type: "procedure"
       warehouse: "ACES_VALIDATION_WH"
       input_schema:
         type: "object"
         properties:
-          position_ids:
-            description: "Array of position IDs to validate"
-            type: "array"
-            items:
-              type: "integer"
+          job_id:
+            description: "Unique validation job identifier"
+            type: "string"
+        required: ["job_id"]
 
-  - name: "validate_part_type_position_batch"
-    title: "Validate Part Type Position Mapping"
+  - name: "validate_part_type_position_job"
+    title: "Validate Part Type Position Mapping for Job"
     type: "GENERIC"
-    identifier: "ACES_VALIDATION.MCP.VALIDATE_PART_TYPE_POSITION_BATCH"
-    description: "Validates part type to position mappings against PCDB."
+    identifier: "ACES_VALIDATION.MCP.VALIDATE_PART_TYPE_POSITION_JOB"
+    description: "Validates part-type-to-position mappings for a specific job against PCDB."
     config:
       type: "procedure"
       warehouse: "ACES_VALIDATION_WH"
       input_schema:
         type: "object"
         properties:
-          mappings:
-            description: "Array of {part_type_id, position_id} objects"
-            type: "array"
+          job_id:
+            description: "Unique validation job identifier"
+            type: "string"
+        required: ["job_id"]
 
-  # Comparison Tools
-  - name: "fetch_existing_fitments_by_products"
-    title: "Fetch Existing Fitments"
+  -- Product Resolution & Comparison Tools
+  - name: "resolve_products_job"
+    title: "Resolve Supplier Parts for Job"
     type: "GENERIC"
-    identifier: "ACES_VALIDATION.MCP.FETCH_EXISTING_FITMENTS_BY_PRODUCTS"
-    description: "Fetches all existing fitments for given product IDs from catalog."
+    identifier: "ACES_VALIDATION.MCP.RESOLVE_PRODUCTS_JOB"
+    description: "Resolves supplier part numbers to catalog product IDs for a specific job."
     config:
       type: "procedure"
       warehouse: "ACES_VALIDATION_WH"
       input_schema:
         type: "object"
         properties:
-          product_ids:
-            description: "Array of product IDs"
-            type: "array"
-            items:
-              type: "integer"
+          job_id:
+            description: "Unique validation job identifier"
+            type: "string"
+          line_code:
+            description: "Catalog brand line code"
+            type: "string"
+        required: ["job_id", "line_code"]
 
-  - name: "classify_fitment_changes_batch"
-    title: "Classify Fitment Changes"
+  - name: "classify_fitment_changes_job"
+    title: "Classify Fitment Changes for Job"
     type: "GENERIC"
-    identifier: "ACES_VALIDATION.MCP.CLASSIFY_FITMENT_CHANGES_BATCH"
-    description: "Classifies incoming fitments as ADD, UPDATE, or UNCHANGED vs existing."
+    identifier: "ACES_VALIDATION.MCP.CLASSIFY_FITMENT_CHANGES_JOB"
+    description: "Compares valid staging fitments vs catalog and classifies them as ADD, UPDATE, or UNCHANGED."
     config:
       type: "procedure"
       warehouse: "ACES_VALIDATION_WH"
       input_schema:
         type: "object"
         properties:
-          incoming_fitments:
-            description: "Array of incoming fitment objects"
-            type: "array"
-          existing_fitments:
-            description: "Array of existing fitment objects"
-            type: "array"
+          job_id:
+            description: "Unique validation job identifier"
+            type: "string"
+        required: ["job_id"]
 
-  - name: "identify_deleted_fitments"
-    title: "Identify Deleted Fitments"
+  - name: "identify_deleted_fitments_job"
+    title: "Identify Deleted Fitments for Job"
     type: "GENERIC"
-    identifier: "ACES_VALIDATION.MCP.IDENTIFY_DELETED_FITMENTS"
-    description: "Identifies fitments in existing but not in incoming (DELETEs)."
+    identifier: "ACES_VALIDATION.MCP.IDENTIFY_DELETED_FITMENTS_JOB"
+    description: "Identifies existing fitments for processed products that are missing from staging (DELETEs)."
     config:
       type: "procedure"
       warehouse: "ACES_VALIDATION_WH"
       input_schema:
         type: "object"
         properties:
-          incoming_keys:
-            description: "Array of composite keys from incoming fitments"
-            type: "array"
-          existing_keys:
-            description: "Array of composite keys from existing fitments"
-            type: "array"
+          job_id:
+            description: "Unique validation job identifier"
+            type: "string"
+        required: ["job_id"]
 
-  # Aggregation Tools
+  -- Aggregation & Reporting Tools
   - name: "compute_validation_summary"
     title: "Compute Validation Summary"
     type: "GENERIC"
@@ -777,14 +911,15 @@ tools:
         type: "object"
         properties:
           job_id:
-            description: "Job identifier"
+            description: "Unique validation job identifier"
             type: "string"
+        required: ["job_id"]
 
   - name: "compute_uplift_summary"
     title: "Compute Uplift Summary"
     type: "GENERIC"
     identifier: "ACES_VALIDATION.MCP.COMPUTE_UPLIFT_SUMMARY"
-    description: "Computes Add/Update/Delete counts for uplift report."
+    description: "Computes Add/Update/Delete counts for a job."
     config:
       type: "procedure"
       warehouse: "ACES_VALIDATION_WH"
@@ -792,8 +927,9 @@ tools:
         type: "object"
         properties:
           job_id:
-            description: "Job identifier"
+            description: "Unique validation job identifier"
             type: "string"
+        required: ["job_id"]
 $$;
 ```
 

@@ -16,6 +16,7 @@ This E2E document provides the consolidated system view. Detailed designs are in
 | **HITL UI Design** | Frontend screens, UX flows, API specification, conversational agent, ingestion architecture | [02-hitl-ui-design.md](./02-hitl-ui-design.md) |
 | **Snowflake & MCP Design** | Schema DDL, stored procedures, MCP server configuration, OAuth, access control | [03-snowflake-mcp-design.md](./03-snowflake-mcp-design.md) |
 | **ACES 4.2 Fitment Attributes** | ACES XML standard reference (fitment rules, vehicle attributes, qualifiers) | [aces-4-2-fitment-attributes.md](./aces-4-2-fitment-attributes.md) |
+| **A2A Agent Design** | Externalizing JobQueryAgent via Google A2A protocol (post-MVP) | [05-a2a-agent-design.md](./05-a2a-agent-design.md) |
 
 ---
 
@@ -527,6 +528,15 @@ Set-Based SQL Validation        -- All processing inside Snowflake
 - Rate limiting and CORS configuration on BFF
 - Security review (cross-job isolation, SQL injection prevention)
 - **Deliverable**: Production-hardened system
+
+### Phase 10: A2A Agent Externalization (Post-MVP)
+- Extract JobQueryAgent into standalone A2A-compliant service
+- Publish Agent Card at `/.well-known/agent.json`
+- Implement `tasks/send` and `tasks/sendSubscribe` (SSE) endpoints
+- Add bearer token authentication and job-ID authorization
+- Deploy as standalone service, integration test with external A2A clients
+- **Deliverable**: Externally accessible query agent via A2A protocol
+- **Reference**: [A2A Agent Design](./05-a2a-agent-design.md)
 
 ---
 
